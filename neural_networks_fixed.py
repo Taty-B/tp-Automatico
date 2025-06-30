@@ -110,6 +110,31 @@ def calculate_accuracy(predictions, targets, ignore_index=-100):
     correct = (predictions.argmax(-1) == targets) & mask
     return correct.sum().float() / mask.sum().float()
 
+def calculate_f1(predictions, targets, num_classes, ignore_index=-100):
+    """Calcula F1 macro ignorando tokens de padding"""
+    mask = (targets != ignore_index)
+    if mask.sum() == 0:
+        return 0.0
+    preds = predictions.argmax(-1)[mask]
+    targs = targets[mask]
+    f1_total = 0.0
+    for c in range(num_classes):
+        tp = ((preds == c) & (targs == c)).sum().float()
+        fp = ((preds == c) & (targs != c)).sum().float()
+        fn = ((preds != c) & (targs == c)).sum().float()
+        if tp + fp == 0 or tp + fn == 0:
+            f1 = 0.0
+        else:
+            precision = tp / (tp + fp)
+            recall = tp / (tp + fn)
+            if precision + recall == 0:
+                f1 = 0.0
+            else:
+                f1 = (2 * precision * recall) / (precision + recall)
+        f1_total += f1
+    return (f1_total / num_classes).item()
+
+
 def get_class_weights(y_data, num_classes):
     """Calcula pesos para balancear clases"""
     # Contar frecuencias (ignorando -100)
@@ -165,9 +190,9 @@ def train_model(params):
     # Pesos por tarea (capitalización más importante por estar desbalanceada)
     task_weights = params.get("task_weights", [1.0, 1.0, 2.0])  # [ini, fin, cap]
 
-    best_val = 1e9
+    best_f1 = -1.0
     patience = 0
-    history = {"train_loss": [], "val_loss": [], "val_acc_ini": [], "val_acc_fin": [], "val_acc_cap": []}
+    history = {"train_loss": [], "val_loss": [], "val_acc_ini": [], "val_acc_fin": [], "val_acc_cap": [], "val_f1_ini": [], "val_f1_fin": [], "val_f1_cap": []}
     
     for epoch in range(1, params["epochs"]+1):
         # ===== ENTRENAMIENTO =====
@@ -194,7 +219,8 @@ def train_model(params):
         # ===== VALIDACIÓN =====
         model.eval()
         val_loss = 0.0
-        val_acc_ini, val_acc_fin, val_acc_cap = 0.0, 0.0, 0.0
+        val_acc_ini = val_acc_fin = val_acc_cap = 0.0
+        val_f1_ini = val_f1_fin = val_f1_cap = 0.0
         
         with torch.no_grad():
             for X, y_i, y_f, y_c, L in dl_val:
@@ -211,10 +237,16 @@ def train_model(params):
                 val_loss += batch_loss.item()
                 
                 # Calcular accuracies
+                val_f1_ini += calculate_f1(p_i, y_i, 2)
+                val_f1_fin += calculate_f1(p_f, y_f, 4)
+                val_f1_cap += calculate_f1(p_c, y_c, 4)
                 val_acc_ini += calculate_accuracy(p_i, y_i).item()
                 val_acc_fin += calculate_accuracy(p_f, y_f).item()
                 val_acc_cap += calculate_accuracy(p_c, y_c).item()
         
+        val_f1_ini /= len(dl_val)
+        val_f1_fin /= len(dl_val)
+        val_f1_cap /= len(dl_val)
         # Promediar métricas
         val_loss /= len(dl_val)
         val_acc_ini /= len(dl_val)
@@ -224,30 +256,33 @@ def train_model(params):
         # Guardar historial
         history["train_loss"].append(tr_loss/len(dl_train))
         history["val_loss"].append(val_loss)
+        history["val_f1_ini"].append(val_f1_ini)
+        history["val_f1_fin"].append(val_f1_fin)
+        history["val_f1_cap"].append(val_f1_cap)
         history["val_acc_ini"].append(val_acc_ini)
         history["val_acc_fin"].append(val_acc_fin)
         history["val_acc_cap"].append(val_acc_cap)
         
         print(f"Epoch {epoch:2d} | train {tr_loss/len(dl_train):.4f} | val {val_loss:.4f} | "
-              f"acc_ini {val_acc_ini:.3f} | acc_fin {val_acc_fin:.3f} | acc_cap {val_acc_cap:.3f}")
+              f"f1_ini {val_f1_ini:.3f} | f1_fin {val_f1_fin:.3f} | f1_cap {val_f1_cap:.3f}")
         
         # Early stopping
-        if val_loss < best_val - 1e-4:
-            best_val = val_loss
+        avg_f1 = (val_f1_ini + val_f1_fin + val_f1_cap) / 3
+        if avg_f1 > best_f1 + 1e-4:
+            best_f1 = avg_f1
             patience = 0
             torch.save(model.state_dict(), "best_bilstm.pt")
-            print("💾 Modelo guardado (mejor validación)")
+            print("💾 Modelo guardado (mejor F1)")
         else:
             patience += 1
             if patience >= params["early_stop"]:
                 print(f"⏹️  Early stopping en época {epoch}")
                 break
-    
     # Guardar historial
     with open("training_history_bilstm.pkl", "wb") as f:
         pickle.dump(history, f)
     
-    print("✅ Entrenamiento finalizado. Mejor val_loss:", best_val)
+    print("✅ Entrenamiento finalizado. Mejor F1:", best_f1)
     return history
 
 # ---------- 5.  Inferencia ----------
