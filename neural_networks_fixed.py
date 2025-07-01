@@ -4,6 +4,15 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple
 
+
+def set_seeds(seed: int = 42):
+    """Fija las semillas para reproducibilidad"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -110,6 +119,53 @@ def calculate_accuracy(predictions, targets, ignore_index=-100):
     correct = (predictions.argmax(-1) == targets) & mask
     return correct.sum().float() / mask.sum().float()
 
+def calculate_f1(predictions, targets, num_classes, ignore_index=-100):
+    """Calcula F1 macro ignorando tokens de padding"""
+    mask = (targets != ignore_index)
+    if mask.sum() == 0:
+        return 0.0
+    preds = predictions.argmax(-1)[mask]
+    targs = targets[mask]
+    f1_total = 0.0
+    for c in range(num_classes):
+        tp = ((preds == c) & (targs == c)).sum().float()
+        fp = ((preds == c) & (targs != c)).sum().float()
+        fn = ((preds != c) & (targs == c)).sum().float()
+        if tp + fp == 0 or tp + fn == 0:
+            f1 = 0.0
+        else:
+            precision = tp / (tp + fp)
+            recall = tp / (tp + fn)
+            if precision + recall == 0:
+                f1 = 0.0
+            else:
+                f1 = (2 * precision * recall) / (precision + recall)
+        f1_total += f1
+    return (f1_total / num_classes).item()
+
+
+def f1_from_labels(preds, targs, num_classes):
+    """Calcula F1 macro dado arrays de labels"""
+    preds = torch.as_tensor(preds)
+    targs = torch.as_tensor(targs)
+    f1_total = 0.0
+    for c in range(num_classes):
+        tp = ((preds == c) & (targs == c)).sum().float()
+        fp = ((preds == c) & (targs != c)).sum().float()
+        fn = ((preds != c) & (targs == c)).sum().float()
+        if tp + fp == 0 or tp + fn == 0:
+            f1 = 0.0
+        else:
+            precision = tp / (tp + fp)
+            recall = tp / (tp + fn)
+            if precision + recall == 0:
+                f1 = 0.0
+            else:
+                f1 = (2 * precision * recall) / (precision + recall)
+        f1_total += f1
+    return (f1_total / num_classes).item()
+
+
 def get_class_weights(y_data, num_classes):
     """Calcula pesos para balancear clases"""
     # Contar frecuencias (ignorando -100)
@@ -127,6 +183,7 @@ def get_class_weights(y_data, num_classes):
 
 # ---------- 4.  Entrenamiento ----------
 def train_model(params):
+    set_seeds(params.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Usando dispositivo: {device}")
     
@@ -144,13 +201,13 @@ def train_model(params):
     # Calcular pesos de clase si está habilitado
     if params.get("use_class_weights", False):
         print("📊 Calculando pesos de clase...")
-        # Cargar un batch para calcular pesos
-        sample_batch = next(iter(dl_train))
-        _, y_i_sample, y_f_sample, y_c_sample, _ = sample_batch
-        
-        w_ini = get_class_weights(y_i_sample.flatten(), 2).to(device)
-        w_fin = get_class_weights(y_f_sample.flatten(), 4).to(device)
-        w_cap = get_class_weights(y_c_sample.flatten(), 4).to(device)
+        y_i_all = torch.as_tensor(ds_train.y_ini).flatten()
+        y_f_all = torch.as_tensor(ds_train.y_fin).flatten()
+        y_c_all = torch.as_tensor(ds_train.y_cap).flatten()
+
+        w_ini = get_class_weights(y_i_all, 2).to(device)
+        w_fin = get_class_weights(y_f_all, 4).to(device)
+        w_cap = get_class_weights(y_c_all, 4).to(device)
         
         print(f"Pesos punt_inicial: {w_ini}")
         print(f"Pesos punt_final: {w_fin}")
@@ -165,9 +222,9 @@ def train_model(params):
     # Pesos por tarea (capitalización más importante por estar desbalanceada)
     task_weights = params.get("task_weights", [1.0, 1.0, 2.0])  # [ini, fin, cap]
 
-    best_val = 1e9
+    best_f1 = -1.0
     patience = 0
-    history = {"train_loss": [], "val_loss": [], "val_acc_ini": [], "val_acc_fin": [], "val_acc_cap": []}
+    history = {"train_loss": [], "val_loss": [], "val_acc_ini": [], "val_acc_fin": [], "val_acc_cap": [], "val_f1_ini": [], "val_f1_fin": [], "val_f1_cap": []}
     
     for epoch in range(1, params["epochs"]+1):
         # ===== ENTRENAMIENTO =====
@@ -188,13 +245,16 @@ def train_model(params):
                    task_weights[2] * loss_cap) / sum(task_weights)
             
             loss.backward()
+            if params.get("grad_clip"):
+                nn.utils.clip_grad_norm_(model.parameters(), params["grad_clip"])
             opt.step()
             tr_loss += loss.item()
         
         # ===== VALIDACIÓN =====
         model.eval()
         val_loss = 0.0
-        val_acc_ini, val_acc_fin, val_acc_cap = 0.0, 0.0, 0.0
+        val_acc_ini = val_acc_fin = val_acc_cap = 0.0
+        val_f1_ini = val_f1_fin = val_f1_cap = 0.0
         
         with torch.no_grad():
             for X, y_i, y_f, y_c, L in dl_val:
@@ -211,10 +271,16 @@ def train_model(params):
                 val_loss += batch_loss.item()
                 
                 # Calcular accuracies
+                val_f1_ini += calculate_f1(p_i, y_i, 2)
+                val_f1_fin += calculate_f1(p_f, y_f, 4)
+                val_f1_cap += calculate_f1(p_c, y_c, 4)
                 val_acc_ini += calculate_accuracy(p_i, y_i).item()
                 val_acc_fin += calculate_accuracy(p_f, y_f).item()
                 val_acc_cap += calculate_accuracy(p_c, y_c).item()
         
+        val_f1_ini /= len(dl_val)
+        val_f1_fin /= len(dl_val)
+        val_f1_cap /= len(dl_val)
         # Promediar métricas
         val_loss /= len(dl_val)
         val_acc_ini /= len(dl_val)
@@ -224,43 +290,73 @@ def train_model(params):
         # Guardar historial
         history["train_loss"].append(tr_loss/len(dl_train))
         history["val_loss"].append(val_loss)
+        history["val_f1_ini"].append(val_f1_ini)
+        history["val_f1_fin"].append(val_f1_fin)
+        history["val_f1_cap"].append(val_f1_cap)
         history["val_acc_ini"].append(val_acc_ini)
         history["val_acc_fin"].append(val_acc_fin)
         history["val_acc_cap"].append(val_acc_cap)
         
-        print(f"Epoch {epoch:2d} | train {tr_loss/len(dl_train):.4f} | val {val_loss:.4f} | "
-              f"acc_ini {val_acc_ini:.3f} | acc_fin {val_acc_fin:.3f} | acc_cap {val_acc_cap:.3f}")
-        
+        # Evaluación opcional a nivel palabra
+        if params.get("word_level_eval"):
+            val_df_epoch = predict(
+                "val",
+                model=model,
+                data_dir=params.get("data_dir", "bert_features"),
+                csv_dir=params.get("csv_dir", "."),
+                batch_size=params["bs"],
+                save_path=None,
+            )
+            f1w_ini, f1w_fin, f1w_cap = evaluate_word_level_f1(val_df_epoch)
+            avg_f1_epoch = (f1w_ini + f1w_fin + f1w_cap) / 3
+        else:
+            avg_f1_epoch = (val_f1_ini + val_f1_fin + val_f1_cap) / 3
+
+        print(
+            f"Epoch {epoch:2d} | train {tr_loss/len(dl_train):.4f} | val {val_loss:.4f} | "
+            f"f1_ini {val_f1_ini:.3f} | f1_fin {val_f1_fin:.3f} | f1_cap {val_f1_cap:.3f}"
+        )
+
         # Early stopping
-        if val_loss < best_val - 1e-4:
-            best_val = val_loss
+        if avg_f1_epoch > best_f1 + 1e-4:
+            best_f1 = avg_f1_epoch
             patience = 0
             torch.save(model.state_dict(), "best_bilstm.pt")
-            print("💾 Modelo guardado (mejor validación)")
+            print("💾 Modelo guardado (mejor F1)")
         else:
             patience += 1
             if patience >= params["early_stop"]:
                 print(f"⏹️  Early stopping en época {epoch}")
                 break
-    
     # Guardar historial
     with open("training_history_bilstm.pkl", "wb") as f:
         pickle.dump(history, f)
     
-    print("✅ Entrenamiento finalizado. Mejor val_loss:", best_val)
+    print("✅ Entrenamiento finalizado. Mejor F1:", best_f1)
     return history
 
 # ---------- 5.  Inferencia ----------
-def predict(split="test", model_path="best_bilstm.pt",
-            data_dir="bert_features", csv_dir=".", 
-            hidden_size=256, num_layers=2, dropout=0.3):
+def predict(
+    split: str = "test",
+    model_path: str = "best_bilstm.pt",
+    model: nn.Module | None = None,
+    save_path: str | None = None,
+    batch_size: int = 32,
+    data_dir: str = "bert_features",
+    csv_dir: str = ".",
+    hidden_size: int = 256,
+    num_layers: int = 2,
+    dropout: float = 0.3,
+) -> pd.DataFrame:
+    """Genera predicciones y devuelve un DataFrame con las columnas agregadas."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = TokenSeqDataset(split, data_dir=data_dir, csv_dir=csv_dir)
-    dl = DataLoader(ds, batch_size=32, shuffle=False, collate_fn=pad_collate)
-    
-    # Crear modelo con la misma arquitectura que se entrenó
-    model = BiLSTMTagger(hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=pad_collate)
+
+    # Crear modelo con la misma arquitectura que se entrenó si no se pasa uno
+    if model is None:
+        model = BiLSTMTagger(hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
+        model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
 
@@ -285,32 +381,88 @@ def predict(split="test", model_path="best_bilstm.pt",
     preds_cap = np.array(preds_cap)
     # reconstruir CSV con las columnas predichas…
     df = pd.read_csv(os.path.join(csv_dir, f"tokenized_{split}.csv"))
-    df["punt_inicial_pred"] = np.where(preds_ini==1, '¿', '')
-    mapa_fin = {0:',', 1:'.', 2:'?', 3:''}
-    df["punt_final_pred"]  = [mapa_fin[x] for x in preds_fin]
+    df["punt_inicial_pred"] = np.where(preds_ini == 1, "¿", "")
+    mapa_fin = {0: ",", 1: ".", 2: "?", 3: ""}
+    df["punt_final_pred"] = [mapa_fin[x] for x in preds_fin]
     df["capitalizacion_pred"] = preds_cap
-    df.to_csv(f"predicciones_{split}.csv", index=False)
-    print("✅  Archivo predicciones guardado ->", f"predicciones_{split}.csv")
+
+    if save_path:
+        df.to_csv(save_path, index=False)
+        print("✅  Archivo predicciones guardado ->", save_path)
     return df
+
+
+def evaluate_word_level_f1(df):
+    """Calcula F1 macro a nivel palabra usando las columnas predichas"""
+
+    def map_fin(val):
+        return {',': 0, '.': 1, '?': 2}.get(val, 3)
+
+    true_ini, pred_ini = [], []
+    true_fin, pred_fin = [], []
+    true_cap, pred_cap = [], []
+
+    current = []
+    prev_inst = None
+    for row in df.itertuples(index=False):
+        if row.instancia_id != prev_inst or not row.token.startswith('##'):
+            if current:
+                first = current[0]
+                last = current[-1]
+                true_ini.append(1 if first.punt_inicial == '¿' else 0)
+                pred_ini.append(1 if first.punt_inicial_pred == '¿' else 0)
+                true_fin.append(map_fin(last.punt_final))
+                pred_fin.append(map_fin(last.punt_final_pred))
+                true_cap.append(first.capitalizacion)
+                pred_cap.append(first.capitalizacion_pred)
+            current = []
+            prev_inst = row.instancia_id
+        current.append(row)
+
+    if current:
+        first = current[0]
+        last = current[-1]
+        true_ini.append(1 if first.punt_inicial == '¿' else 0)
+        pred_ini.append(1 if first.punt_inicial_pred == '¿' else 0)
+        true_fin.append(map_fin(last.punt_final))
+        pred_fin.append(map_fin(last.punt_final_pred))
+        true_cap.append(first.capitalizacion)
+        pred_cap.append(first.capitalizacion_pred)
+
+    f1_ini = f1_from_labels(pred_ini, true_ini, 2)
+    f1_fin = f1_from_labels(pred_fin, true_fin, 4)
+    f1_cap = f1_from_labels(pred_cap, true_cap, 4)
+
+    print(
+        f"F1 macro word-level -> ini {f1_ini:.3f} | fin {f1_fin:.3f} | cap {f1_cap:.3f}"
+    )
+    return f1_ini, f1_fin, f1_cap
 
 # ---------- 6.  Ejemplo de uso ----------
 if __name__ == "__main__":
     # Hiperparámetros mejorados
     hyper = dict(
-        bs=64, 
-        hidden=256, 
-        layers=2, 
+        bs=64,
+        hidden=256,
+        layers=2,
         drop=0.3,
-        lr=2e-3, 
-        epochs=20, 
-        early_stop=3, 
+        lr=2e-3,
+        epochs=20,
+        early_stop=3,
+        seed=42,
         subset=1.0,  # Usar dataset completo para modelo final
         use_class_weights=True,  # Balancear clases
-        task_weights=[1.0, 1.0, 3.0]  # Dar más peso a capitalización
+        task_weights=[1.0, 1.0, 3.0],  # Dar más peso a capitalización
+        grad_clip=1.0,
+        word_level_eval=True,
     )
     
     print("🎯 Iniciando entrenamiento con configuración mejorada...")
     history = train_model(hyper)
     
+    print("🔮 Generando predicciones en validation...")
+    val_df = predict("val", model_path="best_bilstm.pt", save_path="predicciones_val.csv")
+    evaluate_word_level_f1(val_df)
+
     print("🔮 Generando predicciones en test...")
-    predict("test")
+    predict("test", model_path="best_bilstm.pt", save_path="predicciones_test.csv")
