@@ -201,13 +201,13 @@ def train_model(params):
     # Calcular pesos de clase si está habilitado
     if params.get("use_class_weights", False):
         print("📊 Calculando pesos de clase...")
-        # Cargar un batch para calcular pesos
-        sample_batch = next(iter(dl_train))
-        _, y_i_sample, y_f_sample, y_c_sample, _ = sample_batch
-        
-        w_ini = get_class_weights(y_i_sample.flatten(), 2).to(device)
-        w_fin = get_class_weights(y_f_sample.flatten(), 4).to(device)
-        w_cap = get_class_weights(y_c_sample.flatten(), 4).to(device)
+        y_i_all = torch.as_tensor(ds_train.y_ini).flatten()
+        y_f_all = torch.as_tensor(ds_train.y_fin).flatten()
+        y_c_all = torch.as_tensor(ds_train.y_cap).flatten()
+
+        w_ini = get_class_weights(y_i_all, 2).to(device)
+        w_fin = get_class_weights(y_f_all, 4).to(device)
+        w_cap = get_class_weights(y_c_all, 4).to(device)
         
         print(f"Pesos punt_inicial: {w_ini}")
         print(f"Pesos punt_final: {w_fin}")
@@ -245,6 +245,8 @@ def train_model(params):
                    task_weights[2] * loss_cap) / sum(task_weights)
             
             loss.backward()
+            if params.get("grad_clip"):
+                nn.utils.clip_grad_norm_(model.parameters(), params["grad_clip"])
             opt.step()
             tr_loss += loss.item()
         
@@ -295,13 +297,29 @@ def train_model(params):
         history["val_acc_fin"].append(val_acc_fin)
         history["val_acc_cap"].append(val_acc_cap)
         
-        print(f"Epoch {epoch:2d} | train {tr_loss/len(dl_train):.4f} | val {val_loss:.4f} | "
-              f"f1_ini {val_f1_ini:.3f} | f1_fin {val_f1_fin:.3f} | f1_cap {val_f1_cap:.3f}")
-        
+        # Evaluación opcional a nivel palabra
+        if params.get("word_level_eval"):
+            val_df_epoch = predict(
+                "val",
+                model=model,
+                data_dir=params.get("data_dir", "bert_features"),
+                csv_dir=params.get("csv_dir", "."),
+                batch_size=params["bs"],
+                save_path=None,
+            )
+            f1w_ini, f1w_fin, f1w_cap = evaluate_word_level_f1(val_df_epoch)
+            avg_f1_epoch = (f1w_ini + f1w_fin + f1w_cap) / 3
+        else:
+            avg_f1_epoch = (val_f1_ini + val_f1_fin + val_f1_cap) / 3
+
+        print(
+            f"Epoch {epoch:2d} | train {tr_loss/len(dl_train):.4f} | val {val_loss:.4f} | "
+            f"f1_ini {val_f1_ini:.3f} | f1_fin {val_f1_fin:.3f} | f1_cap {val_f1_cap:.3f}"
+        )
+
         # Early stopping
-        avg_f1 = (val_f1_ini + val_f1_fin + val_f1_cap) / 3
-        if avg_f1 > best_f1 + 1e-4:
-            best_f1 = avg_f1
+        if avg_f1_epoch > best_f1 + 1e-4:
+            best_f1 = avg_f1_epoch
             patience = 0
             torch.save(model.state_dict(), "best_bilstm.pt")
             print("💾 Modelo guardado (mejor F1)")
@@ -318,16 +336,27 @@ def train_model(params):
     return history
 
 # ---------- 5.  Inferencia ----------
-def predict(split="test", model_path="best_bilstm.pt",
-            data_dir="bert_features", csv_dir=".",
-            hidden_size=256, num_layers=2, dropout=0.3):
+def predict(
+    split: str = "test",
+    model_path: str = "best_bilstm.pt",
+    model: nn.Module | None = None,
+    save_path: str | None = None,
+    batch_size: int = 32,
+    data_dir: str = "bert_features",
+    csv_dir: str = ".",
+    hidden_size: int = 256,
+    num_layers: int = 2,
+    dropout: float = 0.3,
+) -> pd.DataFrame:
+    """Genera predicciones y devuelve un DataFrame con las columnas agregadas."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = TokenSeqDataset(split, data_dir=data_dir, csv_dir=csv_dir)
-    dl = DataLoader(ds, batch_size=32, shuffle=False, collate_fn=pad_collate)
-    
-    # Crear modelo con la misma arquitectura que se entrenó
-    model = BiLSTMTagger(hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=pad_collate)
+
+    # Crear modelo con la misma arquitectura que se entrenó si no se pasa uno
+    if model is None:
+        model = BiLSTMTagger(hidden_size=hidden_size, num_layers=num_layers, dropout=dropout)
+        model.load_state_dict(torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
 
@@ -352,12 +381,14 @@ def predict(split="test", model_path="best_bilstm.pt",
     preds_cap = np.array(preds_cap)
     # reconstruir CSV con las columnas predichas…
     df = pd.read_csv(os.path.join(csv_dir, f"tokenized_{split}.csv"))
-    df["punt_inicial_pred"] = np.where(preds_ini==1, '¿', '')
-    mapa_fin = {0:',', 1:'.', 2:'?', 3:''}
-    df["punt_final_pred"]  = [mapa_fin[x] for x in preds_fin]
+    df["punt_inicial_pred"] = np.where(preds_ini == 1, "¿", "")
+    mapa_fin = {0: ",", 1: ".", 2: "?", 3: ""}
+    df["punt_final_pred"] = [mapa_fin[x] for x in preds_fin]
     df["capitalizacion_pred"] = preds_cap
-    df.to_csv(f"predicciones_{split}.csv", index=False)
-    print("✅  Archivo predicciones guardado ->", f"predicciones_{split}.csv")
+
+    if save_path:
+        df.to_csv(save_path, index=False)
+        print("✅  Archivo predicciones guardado ->", save_path)
     return df
 
 
@@ -421,15 +452,17 @@ if __name__ == "__main__":
         seed=42,
         subset=1.0,  # Usar dataset completo para modelo final
         use_class_weights=True,  # Balancear clases
-        task_weights=[1.0, 1.0, 3.0]  # Dar más peso a capitalización
+        task_weights=[1.0, 1.0, 3.0],  # Dar más peso a capitalización
+        grad_clip=1.0,
+        word_level_eval=True,
     )
     
     print("🎯 Iniciando entrenamiento con configuración mejorada...")
     history = train_model(hyper)
     
     print("🔮 Generando predicciones en validation...")
-    val_df = predict("val")
+    val_df = predict("val", model_path="best_bilstm.pt", save_path="predicciones_val.csv")
     evaluate_word_level_f1(val_df)
 
     print("🔮 Generando predicciones en test...")
-    predict("test")
+    predict("test", model_path="best_bilstm.pt", save_path="predicciones_test.csv")
