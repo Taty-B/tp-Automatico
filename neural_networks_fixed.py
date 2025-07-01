@@ -4,6 +4,15 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple
 
+
+def set_seeds(seed: int = 42):
+    """Fija las semillas para reproducibilidad"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -135,6 +144,28 @@ def calculate_f1(predictions, targets, num_classes, ignore_index=-100):
     return (f1_total / num_classes).item()
 
 
+def f1_from_labels(preds, targs, num_classes):
+    """Calcula F1 macro dado arrays de labels"""
+    preds = torch.as_tensor(preds)
+    targs = torch.as_tensor(targs)
+    f1_total = 0.0
+    for c in range(num_classes):
+        tp = ((preds == c) & (targs == c)).sum().float()
+        fp = ((preds == c) & (targs != c)).sum().float()
+        fn = ((preds != c) & (targs == c)).sum().float()
+        if tp + fp == 0 or tp + fn == 0:
+            f1 = 0.0
+        else:
+            precision = tp / (tp + fp)
+            recall = tp / (tp + fn)
+            if precision + recall == 0:
+                f1 = 0.0
+            else:
+                f1 = (2 * precision * recall) / (precision + recall)
+        f1_total += f1
+    return (f1_total / num_classes).item()
+
+
 def get_class_weights(y_data, num_classes):
     """Calcula pesos para balancear clases"""
     # Contar frecuencias (ignorando -100)
@@ -152,6 +183,7 @@ def get_class_weights(y_data, num_classes):
 
 # ---------- 4.  Entrenamiento ----------
 def train_model(params):
+    set_seeds(params.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Usando dispositivo: {device}")
     
@@ -287,7 +319,7 @@ def train_model(params):
 
 # ---------- 5.  Inferencia ----------
 def predict(split="test", model_path="best_bilstm.pt",
-            data_dir="bert_features", csv_dir=".", 
+            data_dir="bert_features", csv_dir=".",
             hidden_size=256, num_layers=2, dropout=0.3):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = TokenSeqDataset(split, data_dir=data_dir, csv_dir=csv_dir)
@@ -328,17 +360,65 @@ def predict(split="test", model_path="best_bilstm.pt",
     print("✅  Archivo predicciones guardado ->", f"predicciones_{split}.csv")
     return df
 
+
+def evaluate_word_level_f1(df):
+    """Calcula F1 macro a nivel palabra usando las columnas predichas"""
+
+    def map_fin(val):
+        return {',': 0, '.': 1, '?': 2}.get(val, 3)
+
+    true_ini, pred_ini = [], []
+    true_fin, pred_fin = [], []
+    true_cap, pred_cap = [], []
+
+    current = []
+    prev_inst = None
+    for row in df.itertuples(index=False):
+        if row.instancia_id != prev_inst or not row.token.startswith('##'):
+            if current:
+                first = current[0]
+                last = current[-1]
+                true_ini.append(1 if first.punt_inicial == '¿' else 0)
+                pred_ini.append(1 if first.punt_inicial_pred == '¿' else 0)
+                true_fin.append(map_fin(last.punt_final))
+                pred_fin.append(map_fin(last.punt_final_pred))
+                true_cap.append(first.capitalizacion)
+                pred_cap.append(first.capitalizacion_pred)
+            current = []
+            prev_inst = row.instancia_id
+        current.append(row)
+
+    if current:
+        first = current[0]
+        last = current[-1]
+        true_ini.append(1 if first.punt_inicial == '¿' else 0)
+        pred_ini.append(1 if first.punt_inicial_pred == '¿' else 0)
+        true_fin.append(map_fin(last.punt_final))
+        pred_fin.append(map_fin(last.punt_final_pred))
+        true_cap.append(first.capitalizacion)
+        pred_cap.append(first.capitalizacion_pred)
+
+    f1_ini = f1_from_labels(pred_ini, true_ini, 2)
+    f1_fin = f1_from_labels(pred_fin, true_fin, 4)
+    f1_cap = f1_from_labels(pred_cap, true_cap, 4)
+
+    print(
+        f"F1 macro word-level -> ini {f1_ini:.3f} | fin {f1_fin:.3f} | cap {f1_cap:.3f}"
+    )
+    return f1_ini, f1_fin, f1_cap
+
 # ---------- 6.  Ejemplo de uso ----------
 if __name__ == "__main__":
     # Hiperparámetros mejorados
     hyper = dict(
-        bs=64, 
-        hidden=256, 
-        layers=2, 
+        bs=64,
+        hidden=256,
+        layers=2,
         drop=0.3,
-        lr=2e-3, 
-        epochs=20, 
-        early_stop=3, 
+        lr=2e-3,
+        epochs=20,
+        early_stop=3,
+        seed=42,
         subset=1.0,  # Usar dataset completo para modelo final
         use_class_weights=True,  # Balancear clases
         task_weights=[1.0, 1.0, 3.0]  # Dar más peso a capitalización
@@ -347,5 +427,9 @@ if __name__ == "__main__":
     print("🎯 Iniciando entrenamiento con configuración mejorada...")
     history = train_model(hyper)
     
+    print("🔮 Generando predicciones en validation...")
+    val_df = predict("val")
+    evaluate_word_level_f1(val_df)
+
     print("🔮 Generando predicciones en test...")
     predict("test")
